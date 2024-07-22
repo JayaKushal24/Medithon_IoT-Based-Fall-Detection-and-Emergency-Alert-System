@@ -1,0 +1,204 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include "esp_sleep.h"
+#include <SoftwareSerial.h>
+#include <FirebaseESP32.h>
+#include <WiFi.h>
+
+// MPU6050
+MPU6050 mpu(0x68); // MPU6050 I2C address
+
+// SIM A7672S
+SoftwareSerial simSerial(16, 17); // RX, TX
+
+// Firebase configuration
+#define FIREBASE_HOST "your_firebase_database_url" // e.g., your-database.firebaseio.com
+#define FIREBASE_AUTH "your_firebase_database_secret"
+FirebaseData firebaseData;
+
+// Interrupt pin for MPU6050
+#define MPU_INT_PIN 33
+#define SDA_PIN 35
+#define SCL_PIN 34
+
+// SOS button pin
+#define SOS_PIN 42
+
+unsigned long previousMillis = 0; // Stores last time data was sent to Firebase
+const long interval = 180000; // Interval at which to send data to Firebase (3 minutes)
+bool sosTriggered = false;
+
+void setup() {
+  Serial.begin(115200);
+  simSerial.begin(9600);
+
+  // Initialize I2C with custom pins
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Initialize MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+    while (1);
+  }
+
+  // Configure MPU6050 interrupt for motion detection
+  mpu.setIntEnabled(0x40); // Enable motion detection interrupt
+  mpu.setMotionDetectionThreshold(2); // Set threshold (adjust as needed)
+  mpu.setMotionDetectionDuration(5); // Set duration (adjust as needed)
+  mpu.setDHPFMode(1); // High-pass filter for motion detection
+
+  // Configure interrupt pin
+  pinMode(MPU_INT_PIN, INPUT_PULLUP);
+
+  // Configure SOS button pin
+  pinMode(SOS_PIN, INPUT_PULLUP);
+
+  // Configure ESP32 to wake up on external interrupt
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)MPU_INT_PIN, 0); // Wake up on low level
+
+  // Initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+
+  // Go to deep sleep
+  Serial.println("Going to sleep now");
+  delay(1000);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // This code will not run until the ESP32 wakes up from deep sleep
+  Serial.println("Woke up!");
+
+  if (digitalRead(SOS_PIN) == LOW) {
+    sosTriggered = true;
+    handleSOS();
+  } else {
+    // Read accelerometer and gyroscope data from MPU6050
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    // Print data to Serial Monitor
+    Serial.print("aX: "); Serial.print(ax);
+    Serial.print(" | aY: "); Serial.print(ay);
+    Serial.print(" | aZ: "); Serial.print(az);
+    Serial.print(" | gX: "); Serial.print(gx);
+    Serial.print(" | gY: "); Serial.print(gy);
+    Serial.print(" | gZ: "); Serial.println(gz);
+
+    // Get GPS coordinates
+    String gpsData = getGPSCoordinates();
+
+    // Send data to Firebase
+    sendDataToFirebase(ax, ay, az, gx, gy, gz, gpsData);
+  }
+
+  // Clear the interrupt flag and reconfigure the MPU6050 and interrupt
+  mpu.reset();
+  mpu.initialize();
+  mpu.setIntEnabled(0x40); 
+  mpu.setMotionDetectionThreshold(2);
+  mpu.setMotionDetectionDuration(5);
+  mpu.setDHPFMode(1);
+
+  // Go back to sleep
+  Serial.println("Going back to sleep");
+  delay(1000);
+  esp_deep_sleep_start();
+
+  // Periodic update
+  periodicUpdate();
+}
+
+void handleSOS() {
+  // Get GPS coordinates
+  String gpsData = getGPSCoordinates();
+
+  // Send SMS
+  sendSMS(gpsData);
+
+  // Update Firebase
+  if (Firebase.pushString(firebaseData, "/SOS", gpsData)) {
+    Serial.println("SOS data sent to Firebase successfully");
+  } else {
+    Serial.println("Failed to send SOS data to Firebase");
+    Serial.println(firebaseData.errorReason());
+  }
+}
+
+String getGPSCoordinates() {
+  String gpsData = "";
+  simSerial.println("AT+CGNSPWR=1"); // Turn on GPS
+  delay(1000);
+  simSerial.println("AT+CGNSINF"); // Request GPS info
+  delay(1000);
+
+  while (simSerial.available()) {
+    gpsData += (char)simSerial.read();
+  }
+
+  // Parse GPS data
+  int gpsIndex = gpsData.indexOf("+CGNSINF: ");
+  if (gpsIndex != -1) {
+    gpsData = gpsData.substring(gpsIndex + 10);
+    int commaIndex = gpsData.indexOf(",");
+    gpsData = gpsData.substring(commaIndex + 1);
+    commaIndex = gpsData.indexOf(",");
+    gpsData = gpsData.substring(commaIndex + 1);
+    commaIndex = gpsData.indexOf(",");
+    String latitude = gpsData.substring(0, commaIndex);
+    gpsData = gpsData.substring(commaIndex + 1);
+    commaIndex = gpsData.indexOf(",");
+    String longitude = gpsData.substring(0, commaIndex);
+    gpsData = "Lat: " + latitude + ", Lon: " + longitude;
+  } else {
+    gpsData = "GPS data not available";
+  }
+
+  return gpsData;
+}
+
+void sendSMS(String gpsData) {
+  simSerial.println("AT+CMGF=1"); // Set SMS to text mode
+  delay(1000);
+  simSerial.println("AT+CMGS=\"+1234567890\""); // Replace with your phone number
+  delay(1000);
+  simSerial.print("SOS Alert! GPS coordinates: ");
+  simSerial.print(gpsData);
+  simSerial.write(26); // ASCII code for CTRL+Z to send SMS
+  delay(1000);
+}
+
+void sendDataToFirebase(int16_t ax, int16_t ay, int16_t az, int16_t gx, int16_t gy, int16_t gz, String gpsData) {
+  if (Firebase.pushString(firebaseData, "/sensorData/accelerometer/ax", String(ax)) &&
+      Firebase.pushString(firebaseData, "/sensorData/accelerometer/ay", String(ay)) &&
+      Firebase.pushString(firebaseData, "/sensorData/accelerometer/az", String(az)) &&
+      Firebase.pushString(firebaseData, "/sensorData/gyroscope/gx", String(gx)) &&
+      Firebase.pushString(firebaseData, "/sensorData/gyroscope/gy", String(gy)) &&
+      Firebase.pushString(firebaseData, "/sensorData/gyroscope/gz", String(gz)) &&
+      Firebase.pushString(firebaseData, "/sensorData/gps", gpsData)) {
+    Serial.println("Data sent to Firebase successfully");
+  } else {
+    Serial.println("Failed to send data to Firebase");
+    Serial.println(firebaseData.errorReason());
+  }
+}
+
+void periodicUpdate() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Read accelerometer and gyroscope data from MPU6050
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    // Get GPS coordinates
+    String gpsData = getGPSCoordinates();
+
+    // Send data to Firebase
+    sendDataToFirebase(ax, ay, az, gx, gy, gz, gpsData);
+  }
+}
