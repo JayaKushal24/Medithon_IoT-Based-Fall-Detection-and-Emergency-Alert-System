@@ -1,4 +1,4 @@
-#IoT-Based Fall Detection and Emergency Alert System Using ESP32 and MPU6050
+# IoT-Based Fall Detection and Emergency Alert System Using ESP32 and MPU6050
 Summary:
 Real-time monitoring and emergency assistance for elderly and at-risk individuals.
 
